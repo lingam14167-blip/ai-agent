@@ -1,0 +1,172 @@
+"""PayPal Sandbox OAuth and Orders API helpers."""
+
+import os
+from decimal import Decimal, InvalidOperation
+
+import requests
+
+import currency as currency_utils
+
+SANDBOX_API = "https://api-m.sandbox.paypal.com"
+REQUEST_TIMEOUT = 15
+
+
+class PayPalError(RuntimeError):
+    """Raised when a PayPal Sandbox operation cannot be completed."""
+
+    def __init__(self, message, name=None, issue=None):
+        super().__init__(message)
+        self.name = name
+        self.issue = issue
+
+
+def _response_json(response, operation):
+    try:
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as exc:
+        status = response.status_code
+        try:
+            payload = response.json()
+        except (ValueError, requests.exceptions.JSONDecodeError):
+            payload = None
+        name = payload.get("name") if isinstance(payload, dict) else None
+        details = payload.get("details", []) if isinstance(payload, dict) else []
+        issue = None
+        if isinstance(details, list):
+            issue = next(
+                (
+                    detail["issue"]
+                    for detail in details
+                    if isinstance(detail, dict)
+                    and isinstance(detail.get("issue"), str)
+                ),
+                None,
+            )
+        if not isinstance(name, str):
+            name = None
+        raise PayPalError(
+            f"PayPal {operation} failed with HTTP {status}.",
+            name=name,
+            issue=issue,
+        ) from exc
+    try:
+        return response.json()
+    except (ValueError, requests.exceptions.JSONDecodeError) as exc:
+        raise PayPalError(f"PayPal {operation} returned invalid JSON.") from exc
+
+
+def get_access_token():
+    client_id = os.getenv("PAYPAL_CLIENT_ID")
+    secret = os.getenv("PAYPAL_SECRET")
+    if not client_id or not secret:
+        raise PayPalError(
+            "PayPal sandbox credentials are missing; set PAYPAL_CLIENT_ID and PAYPAL_SECRET."
+        )
+
+    response = requests.post(
+        f"{SANDBOX_API}/v1/oauth2/token",
+        auth=(client_id, secret),
+        data={"grant_type": "client_credentials"},
+        headers={"Accept": "application/json", "Accept-Language": "en_US"},
+        timeout=REQUEST_TIMEOUT,
+    )
+    payload = _response_json(response, "access token request")
+    token = payload.get("access_token")
+    if not token:
+        raise PayPalError("PayPal access token response did not contain an access token.")
+    return token
+
+
+def create_order(access_token, amount, currency="USD", description=""):
+    currency_utils.validate_currency(currency)
+    payload = {
+        "intent": "CAPTURE",
+        "purchase_units": [
+            {
+                "amount": {"currency_code": currency, "value": str(amount)},
+                "description": description,
+            }
+        ],
+    }
+    public_base_url = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if public_base_url:
+        payload["application_context"] = {
+            "return_url": f"{public_base_url}/",
+            "cancel_url": f"{public_base_url}/",
+        }
+    response = requests.post(
+        f"{SANDBOX_API}/v2/checkout/orders",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=REQUEST_TIMEOUT,
+    )
+    payload = _response_json(response, "order creation")
+    order_id = payload.get("id")
+    approval_link = next(
+        (
+            link.get("href")
+            for link in payload.get("links", [])
+            if link.get("rel") == "approve"
+        ),
+        None,
+    )
+    if not order_id or not approval_link:
+        raise PayPalError("PayPal order response is missing its id or approval link.")
+    return {"order_id": order_id, "approval_link": approval_link}
+
+
+def capture_order(
+    access_token,
+    order_id,
+    expected_currency=None,
+    expected_amount=None,
+):
+    if expected_currency is not None:
+        currency_utils.validate_currency(expected_currency)
+    response = requests.post(
+        f"{SANDBOX_API}/v2/checkout/orders/{order_id}/capture",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        json={},
+        timeout=REQUEST_TIMEOUT,
+    )
+    payload = _response_json(response, "order capture")
+    captures = [
+        capture
+        for unit in payload.get("purchase_units", [])
+        for capture in unit.get("payments", {}).get("captures", [])
+    ]
+    capture_id = captures[0].get("id") if captures else None
+    amount = captures[0].get("amount") if captures else None
+    captured_currency = (
+        amount.get("currency_code") if isinstance(amount, dict) else None
+    )
+    value = amount.get("value") if isinstance(amount, dict) else None
+    status = payload.get("status")
+    if not status or not capture_id:
+        raise PayPalError("PayPal capture response is missing its status or capture id.")
+    if expected_currency is not None and captured_currency != expected_currency:
+        raise PayPalError("PayPal capture currency does not match the signed mandate.")
+    if expected_amount is not None:
+        try:
+            captured_amount = Decimal(str(value))
+            authorized_amount = Decimal(str(expected_amount))
+        except (InvalidOperation, ValueError):
+            raise PayPalError("PayPal capture amount is missing or invalid.") from None
+        if (
+            not captured_amount.is_finite()
+            or not authorized_amount.is_finite()
+            or captured_amount != authorized_amount
+        ):
+            raise PayPalError("PayPal capture amount does not match the authorized order.")
+    return {
+        "status": status,
+        "capture_id": capture_id,
+        "amount": value,
+        "currency": captured_currency,
+    }

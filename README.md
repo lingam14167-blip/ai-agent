@@ -1,1 +1,126 @@
-# ai-agent
+# AgentProof AI
+
+Agents will soon spend money for us, but nobody can prove who authorized what. AgentProof is the receipt for agent decisions.
+
+## How it works
+
+1. **Mandate:** A user creates and signs a spending mandate with a maximum total, permitted categories and merchants, and an expiry.
+2. **Policy gate:** The shopping agent proposes a purchase; the policy gate verifies the mandate signature and checks the purchase before any order is created.
+3. **Hash-chained log:** Requests, mandate terms, reasoning, policy decisions, and payment events are recorded in SQLite and linked by hashes so edits can be detected.
+4. **Dispute report:** A report gathers the recorded facts for a purchase, reports the chain status, and provides a plain-English summary.
+5. **Currency:** Select India (INR) or United States (USD) in the top navigation. India is the default, and the selection is saved on this device. Each mandate is signed in its selected currency; changing country requires creating a new mandate before a purchase can proceed. Amounts are entered directly in that currency; the app does not convert prices.
+6. **Demo catalog:** The scripted mock agent selects from six fictional products with original local SVG placeholders. Product names and prices are sample data only; no real shop, logo, product photo, or live price is used.
+
+```text
+ User
+   |
+   v
+ Mandate --signed--> Shopping Agent
+                         |
+                    purchase tool
+                         v
+                   Policy Gate
+                    /       \
+              BLOCK or      ALLOW
+             approval        |
+                 |           v
+                 |     PayPal Sandbox
+                 |           |
+                 +-----+-----+
+                       v
+                Hash-Chained Log
+                       |
+              Dispute Report + UI
+```
+
+## Setup (Windows PowerShell)
+
+Run these commands from the project directory:
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+```
+
+Edit `.env` and set a private `MANDATE_SECRET` before seeding. For Gemini, set
+`GEMINI_API_KEY`; `GEMINI_MODEL` optionally selects a model and defaults to
+`gemini-2.5-flash`. For Anthropic, set `ANTHROPIC_API_KEY`. Set
+`AGENT_PROVIDER` to `gemini`, `anthropic`, or `mock` to choose explicitly.
+When it is unset, the app selects Gemini if `GEMINI_API_KEY` is present,
+otherwise Anthropic if `ANTHROPIC_API_KEY` is present, and otherwise uses a
+scripted mock agent that needs no model API key. To use PayPal Sandbox, also
+add your own `PAYPAL_CLIENT_ID` and `PAYPAL_SECRET`. Keep `.env` private; never
+commit it.
+
+On first startup, the app automatically creates a signed demo mandate if the
+database does not already contain one. To reset and reseed the database
+manually, the script displays the database path and requires you to type
+`RESET` before deleting or recreating it:
+
+```powershell
+python seed_demo.py
+```
+
+Start the app:
+
+```powershell
+.\run.ps1
+```
+
+Open the local URL displayed by Uvicorn. The health check and interactive API
+documentation are available at `/health` and `/docs` on that same host. By
+default, SQLite is stored in `agentproof.db`; set `DB_PATH` to select another
+database file. On Vercel, `VERCEL` selects `/tmp/agentproof.db` unless
+`DB_PATH` is set. Files in `/tmp` are temporary and may not persist between
+serverless instances.
+
+Deployment variable names: `PUBLIC_BASE_URL`, `ENABLE_TAMPER`, `VERCEL`,
+`DB_PATH`. `PUBLIC_BASE_URL` sets PayPal's return and cancel URLs.
+`ENABLE_TAMPER` defaults to true; set it to false to hide and disable the
+tamper action.
+
+## Five-step demo walkthrough
+
+1. **Create the mandate:** On an empty database, start the app and check the
+   automatically signed ₹50 INR accessories mandate in the Mandate panel.
+2. **Try the policy gate:** Run the agent with an allowed accessories purchase;
+   use Rogue Agent to request an over-budget purchase from a disallowed category.
+   The policy gate blocks unauthorized requests before any payment order is made.
+3. **Inspect the evidence:** Review the Audit Log panel and select **Verify**.
+   Use **Tamper Log** to change an old event and see the chain report the broken
+   entry.
+4. **Review the dispute report:** Select **Dispute report** on a purchase's log
+   event to open its request, mandate, reasoning, decision, payment details, and
+   chain status in a printable one-page view.
+5. **Complete a sandbox payment:** For an allowed purchase, open its PayPal
+   approval link and approve it using a PayPal Sandbox buyer account. Then use
+   `POST /paypal/capture/{order_id}` from `/docs` to capture the approved order.
+   The capture is recorded only after PayPal returns a successful response.
+
+## PayPal APIs
+
+The app uses the PayPal **Sandbox** at `https://api-m.sandbox.paypal.com`.
+It obtains an OAuth access token, creates an order with the Orders API v2
+(`POST /v2/checkout/orders`, intent `CAPTURE`), and captures an approved order
+with `POST /v2/checkout/orders/{order_id}/capture`. The buyer must approve the
+order through its returned approval link before capture can succeed.
+
+## Limitations
+
+- **Sandbox only:** This project targets PayPal Sandbox; it is not configured
+  for live payments.
+- **Demo-grade HMAC signing:** HMAC-SHA256 protects mandate integrity, but this
+  is a hackathon demo, not a production key-management or signing service.
+- **Single user:** The local SQLite store has one current mandate and no
+  multi-user authentication or isolation.
+- **Hardcoded agent:** The shopping agent uses a single tool and simple fixed
+  prompts; it is not a production autonomous purchasing system.
+Verifies an AI agent's final PayPal checkout against your original request before payment, warns on mismatches, and records an intent receipt linking request, decision, and transaction.
+
+
+## Run it locally
+
+Run `.\run.ps1` from PowerShell, then open the local URL displayed by Uvicorn.
+Interactive API documentation is available at `/docs` on that host.
